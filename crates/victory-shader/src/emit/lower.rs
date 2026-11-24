@@ -2542,6 +2542,43 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(b));
                     Ok(())
                 }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    // Sets (clears) bit src[4:0] of the 64-bit destination.
+                    // The bit position determines which dword to modify:
+                    // - bit < 32: modify low dword at position `bit`
+                    // - bit >= 32: modify high dword at position `bit - 32`
+                    let old_lo = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                    let old_hi_code = dst_code.map(|c| Operand::Scalar { code: c + 1, .. });
+                    let old_hi = if let Some(op) = old_hi_code {
+                        self.operand(inst, op)?
+                    } else {
+                        self.s.m.i32(0)
+                    };
+                    let a = src32(self, 0)?;
+                    let (k31, k32, one) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(1));
+                    let bit_in_lo = self.s.m.bin(c, Bin::And, a, k31);
+                    let bit_in_hi_flag = self.s.m.bin(c, Bin::And, a, k32);
+                    let in_hi = self.s.m.cmp(c, pred::NE, bit_in_hi_flag, self.s.m.i32(0));
+                    let bit_mask = self.s.m.bin(c, Bin::Shl, one, bit_in_lo);
+                    let bit_mask_hi = self.s.m.bin(c, Bin::Shl, bit_mask, k32);
+                    if name == "s_bitset1_b64" {
+                        // Set bit: only modify lo when bit is in lo (in_hi = false)
+                        let new_lo = self.s.m.select(c, in_hi, old_lo, self.s.m.bin(c, Bin::Or, old_lo, bit_mask));
+                        let new_hi = self.s.m.select(c, in_hi, self.s.m.bin(c, Bin::Or, old_hi, bit_mask_hi), old_hi);
+                        self.set(lo, Val::I32(new_lo));
+                        self.set(hi, Val::I32(new_hi));
+                    } else {
+                        // Clear bit: only modify lo when bit is in lo (in_hi = false)
+                        let ones = self.s.m.i32(u32::MAX);
+                        let inv_mask = self.s.m.bin(c, Bin::Xor, bit_mask, ones);
+                        let inv_mask_hi = self.s.m.bin(c, Bin::Xor, bit_mask_hi, ones);
+                        let new_lo = self.s.m.select(c, in_hi, old_lo, self.s.m.bin(c, Bin::And, old_lo, inv_mask));
+                        let new_hi = self.s.m.select(c, in_hi, self.s.m.bin(c, Bin::And, old_hi, inv_mask_hi), old_hi);
+                        self.set(lo, Val::I32(new_lo));
+                        self.set(hi, Val::I32(new_hi));
+                    }
+                    Ok(())
+                }
                 "s_cselect_b64" => {
                     let cond = self.scc_in(inst)?;
                     for (h, v) in [(0, lo), (1, hi)] {
@@ -6944,7 +6981,7 @@ mod tests {
             0xBE84_0380, // s_mov_b32 s4, 0
             S_ENDPGM,
         ];
-        let bit_tests: [&[u32]; 4] = [
+        let bit_tests: [&[u32]; 6] = [
             &[0xBE81_0387, 0xBF0C_8301], // s_mov_b32 s1, 7; s_bitcmp0_b32 s1, 3
             &[0xBE81_0387, 0xBF0D_8301], // s_mov_b32 s1, 7; s_bitcmp1_b32 s1, 3
             &[
@@ -6956,6 +6993,16 @@ mod tests {
                 0xBE80_0387, // s_mov_b32 s0, 7
                 0xBE81_0380, // s_mov_b32 s1, 0
                 0xBF0F_8300, // s_bitcmp1_b64 s[0:1], 3
+            ],
+            &[
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBE80_1C03, // s_bitset0_b64 s[0:1], 3 (clear bit 3)
+            ],
+            &[
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBE80_1E23, // s_bitset1_b64 s[0:1], 35 (set bit 3+32=35 in high dword)
             ],
         ];
         for head in bit_tests {
